@@ -14,16 +14,16 @@
 *  - Efficient regulation in the range of 0.5°C
 *  - Sound alarm warns when target temperature is reached
 *  - Automatic detection of lid opening and closing : regulation does not get mad when temperature probe is taken out of the water (which is a thing you need to do if you want to actually put food in your cooker)
-*  - Safety features : 
+*  - Safety features :
 *     - automatic cut-off after 5 minutes of continuous heating providing no change in temperature
 *     - automatic cut-off after 24 hours of operation
 *     - automatic cut-off when temperature reaches 95 °C
-*     - allows target temperature only in the safe 50°c to 90°C range 
+*     - allows target temperature only in the safe 50°c to 90°C range
 *  - Dead cheap and simple : no expensive LCD or Solid State Relay
 *
 *
 *  License
-*	
+*
 *  Copyright (C) 2014  Etienne Giust
 *
 *  This program is free software: you can redistribute it and/or modify
@@ -45,11 +45,11 @@
 // ------------------------- PARTS NEEDED
 
 // Arduino board
-// integrated 8 digits led display with MAX7219 control module (3 wire interface) 
+// integrated 8 digits led display with MAX7219 control module (3 wire interface)
 // Pushbutton x 2
-// Piezo element 
+// Piezo element
 // Waterproof DS18B20 Digital temperature sensor
-// 4.7K ohm resistor 
+// 4.7K ohm resistor
 // 5V Relay module for Arduino, capable to drive AC125/250V at 10A
 // Rice Cooker
 
@@ -63,9 +63,28 @@
 // outputs
 // Relay on pin 8
 // Speaker (piezo) on pin 13
-// 8 digit LED display  DataIn on pin 12 
-// 8 digit LED display  CLK on pin 11 
-// 8 digit LED display  LOAD on pin 10 
+// 8 digit LED display  DataIn on pin 12
+// 8 digit LED display  CLK on pin 11
+// 8 digit LED display  LOAD on pin 10
+
+
+
+// Changes to Original Code
+// Changed Piezo Pin from pin 13 to pin 7
+// Added a Status Indicator on PIN13. Flashes onboard LED to let user know what state the Arduino is currenty in
+// Flipped RELAY_OUT_PIN from active HIGH to LOW for an active low relay I purchased
+// Hardcoded temperature to 60 deg celcius
+// State Indicator Blinker Meanings
+//
+// 1 - INITIAL_WAIT
+// 2 - TEMP_DROP
+// 3 - TEMP_RISE
+// 4 - FIRST_RAMP
+// 5 - COUNTER_FALL
+// 6 - BOOST_TEMP
+// 7 - WAIT_NATURAL_DROP
+// 8 - REGULATE
+
 
 
 // ------------------------- LIBRARIES
@@ -87,7 +106,7 @@
 #define BT_TEMP_LESS_PIN 5 //INPUT_PULLUP mode
 
 // piezo
-#define PIEZO_PIN 13
+#define PIEZO_PIN 7
 
 // temperature sensor
 #define ONE_WIRE_BUS 9
@@ -98,6 +117,8 @@
 // relay
 #define RELAY_OUT_PIN 8
 
+// status Indicator
+#define STATUS_INDICATOR_PIN 13
 
 // First Ramp
 #define FIRST_RAMP_CUTOFF_RATIO 0.65
@@ -123,7 +144,7 @@ int sw_tempLess;
 // temperatures
 double environmentTemp = 0;
 double actualTemp = 0;
-double targetTemp = 0;
+double targetTemp = 60;
 double storedTargetTemp = 0;
 double initialTemp = 0;
 double firstRampCutOffTemp = 0;
@@ -191,24 +212,24 @@ unsigned long  tCheckNotHeatingWildly;
 
 /*
  LedControl :
- pin 12 is connected to the DataIn 
- pin 11 is connected to the CLK 
- pin 10 is connected to LOAD 
+ pin 12 is connected to the DataIn
+ pin 11 is connected to the CLK
+ pin 10 is connected to LOAD
  We have 1 MAX7219.
 */
 LedControl lc=LedControl(12,11,10,1);
 // Set up a oneWire instance and Dallas temperature sensor
 OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature sensors(&oneWire);	
+DallasTemperature sensors(&oneWire);
 // variable to store temperature probe address
-DeviceAddress tempProbeAddress; 
+DeviceAddress tempProbeAddress;
 
 
 // ------------------------- SETUP
 
 void setup() {
 
-	Serial.begin(9600); 
+	Serial.begin(9600);
 	/*
 	Initialize MAX7219 display driver
 	*/
@@ -225,16 +246,22 @@ void setup() {
 	Initialize temperature sensor
 	*/
 	sensors.begin();
-	delay(1000);   
-	sensors.getAddress(tempProbeAddress, 0);  
-	delay(1000);   
+	delay(1000);
+	sensors.getAddress(tempProbeAddress, 0);
+	delay(1000);
 	sensors.requestTemperaturesByIndex(0); // Send the command to get temperatures
 	delay(1000);
 	/*
 	Read temperature
 	*/
 	actualTemp =  sensors.getTempC(tempProbeAddress);
-	targetTemp = (long) ((int)actualTemp);
+
+	//Original Code to set targetTemp at setup
+	//targetTemp = (long) ((int)actualTemp);
+
+	//Hardcode Target temp for Eggs
+	//targetTemp = 60;
+
 
 	/*
 	Write initial values to display
@@ -243,13 +270,16 @@ void setup() {
 	displayTargetTemp(targetTemp);
 
 	//prepare Relay port for writing
-	pinMode(RELAY_OUT_PIN, OUTPUT);  
-	digitalWrite(RELAY_OUT_PIN,LOW);
+	pinMode(RELAY_OUT_PIN, OUTPUT);
+	digitalWrite(RELAY_OUT_PIN,HIGH);
+
+	//prepare STATUS INDICATOR PIN for writing
+	pinMode(STATUS_INDICATOR_PIN, OUTPUT);
 
 	tcurrent = millis();
 	maxUptimeMillis = MAX_UPTIME_HOURS * (unsigned long)3600 * (unsigned long)1000;
 
-	// Initial State  
+	// Initial State
 	warningsBeforeCounterFall = 3;
 	opState = INITIAL_WAIT;
 
@@ -265,37 +295,39 @@ void setup() {
 /**************************************************************************************/
 
 
-void loop() {   
-      
+void loop() {
+
   tcurrent = millis();
-  
-    
+
+
   // get temperature every few seconds and output it to serial if needed. Alert if we are within range
   GetTemperatureAndEnforceSecurity();
   // compute current temperatue Derivative
   SetActualDerivative();
-  
-  
+
+
   switch (opState)
    {
-	case INITIAL_WAIT:			
+	case INITIAL_WAIT:
+		statusIndicator(1);
 		// wait for initial temperature stability
 		if (abs(actualTemp - tempPreviousArray[1] ) < 0.1)
-		{		
+		{
 			if (environmentTemp == 0)
-			{				
+			{
 				// store initial temp, but not more than 30 degrees
-				environmentTemp = min(actualTemp, 30);			
+				environmentTemp = min(actualTemp, 30);
 			}
 			// check if target temp is in acceptable range and switch to first ramp if so
 			if(targetTemp >= MIN_TARGET_TEMP)
 			{
-				StartInitialRamping();        
+				StartInitialRamping();
 			}
-		}		
+		}
 		break;
-	  
+
 	case TEMP_DROP:
+		statusIndicator(2);
 		// wait for stabilization or for sudden rise
 		if (waitForSuddenRise == false && IsStabilizing())
 		{
@@ -303,17 +335,17 @@ void loop() {
 			{
 				// we are close to environmentTemp. The temp probe is probably off-water; wait till temperature rises again sharply then stablilizes
 				waitForSuddenRise = true;
-				
+
 				Serial.println("TEMP_DROP : wait temprise");
 			} else {
-				// something very cold was inserted in the cooker; or not. either way, the temp probe is back. let's regulate 							
+				// something very cold was inserted in the cooker; or not. either way, the temp probe is back. let's regulate
 				if (doBackToFirstRampWhenStabilizing)
 				{
 					Serial.println("TEMP_RISE : initial ramping");
 					opState = FIRST_RAMP;
-				} 
-				else 
-				{				
+				}
+				else
+				{
 					Serial.println(" TEMP_DROP : Cold ! reg");
 					EnterRegulateStateOrWaitSmoothLowering();
 				}
@@ -321,57 +353,60 @@ void loop() {
 		}
 		WatchForTempFalling();
 		break;
-		
+
 	case TEMP_RISE:
+		statusIndicator(3);
 		// wait for stabilization, then Regulate
 		if ( IsStabilizingOrDropping() )
-		{			
+		{
 			if (doBackToFirstRampWhenStabilizing)
 			{
 				Serial.println(" TEMP_RISE : back to initial ramping");
 				opState = FIRST_RAMP;
-			} 
-			else 
-			{	
+			}
+			else
+			{
 				Serial.println(" TEMP_RISE : back to normal : reg");
 				EnterRegulateStateOrWaitSmoothLowering();
 			}
 		}
 		WatchForTempFalling();
 		break;
-		
-	case FIRST_RAMP:
-		PerformFirstRamp();
-		break;   
 
-	case COUNTER_FALL:	
+	case FIRST_RAMP:
+		statusIndicator(4);
+		PerformFirstRamp();
+		break;
+
+	case COUNTER_FALL:
+		statusIndicator(5);
 		// START CONDITION : temp well below target && important negative derivative , but not freefall : -0.1 < d < -0.01,  3 times in a row
-	
+
 		// ON, until deriv == 0 then cut and wait stabilization
-		if (isNewSample) 
-		{		
+		if (isNewSample)
+		{
 			Serial.println(" Counterfall check");
-			if (waitingForStabilization == false)	
-			{			
+			if (waitingForStabilization == false)
+			{
 				// check derivative
 				//if(isDerivativeReliable && currentTempDerivative > -0.005)
 				double predicted = predictTemp(tOperationalDelay) ;
 				Serial.print(" predicted temp : ");
 				Serial.println(predicted);
-				
+
 				if ( predicted >= (targetTemp - 1)  && isDerivativeReliable && currentTempDerivative > 0.001)  // targetTemp - 1 is to avoid overshoot because prediction is not precise enough
 				{
 					Serial.println(" TURNOFFRELAY !");
 					turnOffRelay();
 					waitingForStabilization = true;
-				}					
-			} 
-			else 
+				}
+			}
+			else
 			{
 				if ( IsStabilizingOrDropping() )
 				{
 					Serial.println(" COUNTER_FALL finished : reg");
-					
+
 					//reset counter
 					warningsBeforeCounterFall = 3;
 					EnterRegulateStateOrWaitSmoothLowering();
@@ -380,27 +415,29 @@ void loop() {
 				{
 					turnOnRelay();
 					waitingForStabilization = false;
-				}				
-			}		
+				}
+			}
 		}
-		break;		
-	case BOOST_TEMP:		
+		break;
+	case BOOST_TEMP:
+		statusIndicator(6);
 		PerformBoostTemp();
 		WatchForTempFalling();
-		break; 
+		break;
 
 
 	case WAIT_NATURAL_DROP:
-		if (isNewSample) 
-		{	
+		statusIndicator(7);
+		if (isNewSample)
+		{
 			// when temp is close enough to target, try to calculate regulation values if they are not already set
 			if (isCounteracting == false && parametersRegulationSetForTemp != targetTemp && abs(actualTemp - targetTemp) < 3 )
 			{
 				PerformRegulationCalculations();
-			}	
-			
+			}
+
 			// predict temp at t + tOperationalDelay
-			double futureTemp = predictTemp(tOperationalDelay);	
+			double futureTemp = predictTemp(tOperationalDelay);
 			// counter act to stabilize near targetTemp
 			if (isCounteracting == false && futureTemp < targetTemp)
 			{
@@ -411,31 +448,32 @@ void loop() {
 			if ( ((long) (millis() - tCheckStabilize) >= 0) && isCounteracting )
 			{
 				if(IsStabilizingOrGrowing())
-				{ 
-					Serial.println("NATURAL_DROP ended: wait stabilize");					
+				{
+					Serial.println("NATURAL_DROP ended: wait stabilize");
 					opState = TEMP_RISE; // make sure we stabilize before regulating again
-				} 
-				
+				}
+
 				if(IsAcceleratingFall())
 				{
 					Serial.println("fall:tryagain!");
 					isCounteracting = false;
-				}			
+				}
 			}
 			// we fell too much
 			if (actualTemp < targetTemp - 0.1)
 			{
-				StartBoostToTarget();	
+				StartBoostToTarget();
 			}
-		}	
+		}
 		WatchForTempFalling();
-		break;  
+		break;
 	case REGULATE:
+		statusIndicator(8);
 		Regulate();
 		WatchForTempFalling();
-		break;  
+		break;
    }
-   
+
    if (opState != FIRST_RAMP && opState != COUNTER_FALL)
    {
 		// check each time if relay needs to be turned off (except during initial ramping or counter action)
@@ -444,16 +482,16 @@ void loop() {
 			turnOffRelay();
 		}
    }
-   
+
   // read buttons state
   readButtonInputs();
-  
+
   // update displays
   displayActualTemp(actualTemp);
   displayTargetTemp(targetTemp);
- 
+
   // pause loop
-  delay(delaytime); 
+  delay(delaytime);
 }
 
 
@@ -469,7 +507,7 @@ void loop() {
 void ResetVariablesForRegulationCalculation()
 {
 	maxRegTEmp = 0;
-	minRegTEmp = 1000;	
+	minRegTEmp = 1000;
 }
 
 void EnterRegulateStateOrWaitSmoothLowering()
@@ -479,21 +517,21 @@ void EnterRegulateStateOrWaitSmoothLowering()
 	{
 		Serial.println("EnterRegulateState !");
 		ResetVariablesForRegulationCalculation();
-		
-		tBackToHigh = 0;	
+
+		tBackToHigh = 0;
 		// make sure we do not start heating right away when entering regulation over target value
 		if (parametersRegulationSetForTemp == targetTemp && actualTemp > targetTemp )
-		{	
+		{
 			tBackToHigh = 	millis() + durationOffPulse;
-		} 
+		}
 		tBackToLow = 0;
 		tMinReg = 0;
 		tMaxReg = 0;
 		tStartRealRegulation = 0;
 
 		opState = REGULATE;
-	} 
-	else 
+	}
+	else
 	{
 		WaitForNaturalDrop();
 	}
@@ -503,12 +541,12 @@ void WaitForNaturalDrop()
 {
 	opState = WAIT_NATURAL_DROP;
 	isCounteracting = false;
-	Serial.println("WAIT_NATURAL_DROP!"); 
-	ResetVariablesForRegulationCalculation();	
+	Serial.println("WAIT_NATURAL_DROP!");
+	ResetVariablesForRegulationCalculation();
 }
 
 void Regulate()
-{  
+{
 	if (actualTemp > ( targetTemp + 0.2 ))
 	{
 		// adapt regul values : they are too high
@@ -527,11 +565,11 @@ void Regulate()
 			Serial.print("durationOnPulse = ");
 			Serial.println(durationOnPulse);
 
-			
+
 			WaitForNaturalDrop();
 		}
 	}
-	
+
 	// try to regulate temperature when we are at a stable targetTemp
 
 	// Maybe we are far below the goal ; time for a boost ?
@@ -549,14 +587,14 @@ void Regulate()
 			Serial.print("durationOffPulse = ");
 			Serial.print(durationOffPulse);
 			Serial.print("   durationOnPulse = ");
-			Serial.println(durationOnPulse);			
-		}	  
-		StartBoostToTarget();		
-	} 
-	else 
-	{			
+			Serial.println(durationOnPulse);
+		}
+		StartBoostToTarget();
+	}
+	else
+	{
 		if (parametersRegulationSetForTemp == targetTemp )
-		{			
+		{
 			if (tStartRealRegulation == 0)
 			{
 				tStartRealRegulation = millis();
@@ -564,7 +602,7 @@ void Regulate()
 			}
 			// We already have ON and OFF durations
 			// perform regulation
-			if (digitalRead(RELAY_OUT_PIN) == LOW) {
+			if (digitalRead(RELAY_OUT_PIN) == HIGH) {
 				// check if downtime over
 				if ( (long) (millis() - tBackToHigh) >= 0)
 				{
@@ -572,22 +610,22 @@ void Regulate()
 					tBackToLow = millis() + durationOnPulse + burnupTime;
 					tBackToHigh = millis() + durationOnPulse + burnupTime + durationOffPulse;
 				}
-			}			
-		} 
+			}
+		}
 		else
 		{
 			if ((targetTemp - actualTemp) >= 0.1)
 			{
 				//perform a boost with slight overshoot first
-				StartBoostToTarget(0.1);	
-			} 
+				StartBoostToTarget(0.1);
+			}
 			else
 			{
-				// find suitable ON and OFF durations					 
+				// find suitable ON and OFF durations
 				PerformRegulationCalculations();
-			}			
+			}
 		}
-	}  
+	}
 }
 
 void PerformRegulationCalculations()
@@ -595,22 +633,22 @@ void PerformRegulationCalculations()
 	if (isNewSample && IsFallingNaturally() && tempPreviousArray[0] != 0 && tempPreviousArray[1] != 0 && tempPreviousArray[2] != 0)
 	{
 		// calc average of 3 last samples
-		
+
 		double averageTemp3 = (tempPreviousArray[0] + tempPreviousArray[1] +tempPreviousArray[2]) / 3;
-	 
+
 		// find max and min temperatures
 		if (averageTemp3 > maxRegTEmp)
 		{
 			maxRegTEmp = averageTemp3;
 			tMaxReg = millis();
-		}					
-		
+		}
+
 		if (averageTemp3 < minRegTEmp)
 		{
 			minRegTEmp = averageTemp3;
 			tMinReg = millis();
 		}
-		
+
 		Serial.print(" --- avgTemp3 = ");
 		Serial.print(averageTemp3, DEC);
 		Serial.print(" --- maxRegTEmp = ");
@@ -621,18 +659,18 @@ void PerformRegulationCalculations()
 		Serial.print(tMaxReg);
 		Serial.print(" --- tMinReg = ");
 		Serial.println(tMinReg);
-		
-		
+
+
 		// wait till we lost DROP_DEGREES_FOR_CALC_REGULATION degrees
 		if (maxRegTEmp > 0 && minRegTEmp > 0 && (((long)(tMinReg - tMaxReg)) > 0) && ((maxRegTEmp - minRegTEmp) > DROP_DEGREES_FOR_CALC_REGULATION))
-		{											
+		{
 			// Try to come up with Pulse durations (ON and OFF) to counteract temperature loss
-			SetApproximatePulseDurationsForREgulation(maxRegTEmp - minRegTEmp, tMinReg - tMaxReg);		
+			SetApproximatePulseDurationsForREgulation(maxRegTEmp - minRegTEmp, tMinReg - tMaxReg);
 
 			// back to target temp
-			StartBoostToTarget();							
+			StartBoostToTarget();
 		}
-	}	
+	}
 }
 
 bool checkDerivativeReliable()
@@ -652,12 +690,12 @@ void SetActualDerivative()
 {
 	if (isNewSample)
 	{
-		isDerivativeReliable = checkDerivativeReliable();		
-		Serial.print("d = ");	
+		isDerivativeReliable = checkDerivativeReliable();
+		Serial.print("d = ");
 		if (isDerivativeReliable)
 		{
 			//remove biggest and lowest values (get rid off irregularities)
-			
+
 			// identify lowest and highest
 			double lowest =  1000;
 			double highest =  0;
@@ -665,11 +703,11 @@ void SetActualDerivative()
 			for(i=0;i<6;i++) {
 				if(tempPreviousArray[i] > highest)
 				highest = tempPreviousArray[i];
-				
+
 				if(tempPreviousArray[i] < lowest)
 				lowest = tempPreviousArray[i];
 			}
-			
+
 			double tempTemp[6];
 			double filteredValues[4];
 			bool isHighestRemoved = false;
@@ -685,7 +723,7 @@ void SetActualDerivative()
 						isLowestRemoved = true;
 					} else {
 						tempTemp[i] = tempPreviousArray[i];
-					}					
+					}
 				}
 				// remove highest value to the starts of the array
 				for(i=0;i<6;i++) {
@@ -693,10 +731,10 @@ void SetActualDerivative()
 					{
 						tempTemp[i] = 0;
 						isHighestRemoved = true;
-					} 				
-				}				
-			} 
-			else			
+					}
+				}
+			}
+			else
 			{
 				//descending trend : remove lowest value to the starts of the array
 				for(i=0;i<6;i++) {
@@ -706,7 +744,7 @@ void SetActualDerivative()
 						isLowestRemoved = true;
 					} else {
 						tempTemp[i] = tempPreviousArray[i];
-					}					
+					}
 				}
 				// remove highest value to the end
 				for(i=5;i>=0;i--) {
@@ -714,7 +752,7 @@ void SetActualDerivative()
 					{
 						tempTemp[i] = 0;
 						isHighestRemoved = true;
-					} 				
+					}
 				}
 			}
 			int j = 0;
@@ -723,9 +761,9 @@ void SetActualDerivative()
 				{
 					filteredValues[j] = tempTemp[i];
 					j++;
-				}					
+				}
 			}
-			
+
 			double pastValues[2];
 			pastValues[0] = ( filteredValues[0] + filteredValues[1] ) / 2;
 			pastValues[1] = ( filteredValues[2] + filteredValues[3] ) / 2;
@@ -735,20 +773,20 @@ void SetActualDerivative()
 			Serial.println(currentTempDerivative, DEC);
 		}	else
 		{
-			Serial.println("NC!");	
+			Serial.println("NC!");
 		}
-	}	
+	}
 }
 
 void GetTemperatureAndEnforceSecurity()
 {
 	if ( (long) (tcurrent - tGetTemperatureSample) >= 0)
 	{
-		actualTemp = getTemperature();		
-		
+		actualTemp = getTemperature();
+
 		if (opState != TEMP_DROP && (tempPreviousArray[0] - actualTemp > 2))
 		{
-			//sudden drop in temperature -> temp probe off-water			
+			//sudden drop in temperature -> temp probe off-water
 			if(opState == COUNTER_FALL || opState == FIRST_RAMP)
 			{
 				tBackToLow = 0;
@@ -758,21 +796,21 @@ void GetTemperatureAndEnforceSecurity()
 					doBackToFirstRampWhenStabilizing = true;
 				}
 			}
-			
+
 			opState = TEMP_DROP;
 			tempBeforeDrop = tempPreviousArray[0];
-			waitForSuddenRise = false;	
-			Serial.println("REMOVED TEMP PROBE!");	
-			
+			waitForSuddenRise = false;
+			Serial.println("REMOVED TEMP PROBE!");
+
 			if (tStartBoostTemp - millis() <= 3 * SAMPLE_DELAY)
 			{
 				// we probably boosted temp wrongly as temp probe was off-water
 				// cancel boost
 				tBackToLow = 0;
 			}
-			
-			
-		}	
+
+
+		}
 		if (opState == TEMP_DROP && (actualTemp - tempPreviousArray[0] > 2))
 		{
 			//sudden rise in temperature -> temp probe back in water
@@ -783,12 +821,12 @@ void GetTemperatureAndEnforceSecurity()
 			tempPreviousArray[3]=0;
 			tempPreviousArray[4]=0;
 			tempPreviousArray[5]=0;
-				
+
 			Serial.println("PROBE BACK");
-		}	
+		}
 		if (opState == BOOST_TEMP && (actualTemp - tempPreviousArray[0] > 1))
 		{
-			//sudden rise in temperature during BOOST_TEMP -> maybe temp probe was just put back in water			
+			//sudden rise in temperature during BOOST_TEMP -> maybe temp probe was just put back in water
 			if (tStartBoostTemp - millis() <= 3 * SAMPLE_DELAY)
 			{
 				// we probably boosted temp wrongly as temp probe was off-water
@@ -802,22 +840,22 @@ void GetTemperatureAndEnforceSecurity()
 			tempPreviousArray[4]=0;
 			tempPreviousArray[5]=0;
 		}
-		
-		tempPreviousArrayPushValue(actualTemp); 
+
+		tempPreviousArrayPushValue(actualTemp);
 		isNewSample = true;
 		if (OUTPUT_TO_SERIAL) {
 		  Serial.print(tcurrent/1000, DEC);
 		  Serial.print(";  ");
 		  Serial.println(actualTemp, 3);
-		}    
+		}
 		if (actualTemp > targetTemp + 0.15)
 		{
 			//	force to turn off when no need to be ON (0.15 offset accounts for regulation conditions)
 			tBackToLow = 0;
 		}
-		
+
 		alertTemperatureNearlySet();
-		checkShutdownConditions();		
+		checkShutdownConditions();
 	} else {
 		isNewSample = false;
 	}
@@ -838,11 +876,11 @@ void WatchForTempFalling()
 				waitingForStabilization = false;
 				opState = COUNTER_FALL;
 			}
-		}	
-		else 
+		}
+		else
 		{
 			warningsBeforeCounterFall = 3;
-		}	
+		}
 	}
 }
 
@@ -855,14 +893,14 @@ void StartBoostToTarget()
 void StartBoostToTarget(double offset)
 {
 	// predict value at t + tOperationalDelay
-	actualTempAtBoostStart = actualTemp;	
+	actualTempAtBoostStart = actualTemp;
 	double realTargetTemp = targetTemp + offset;
 	if (realTargetTemp > actualTempAtBoostStart)
-	{	
+	{
 		expectedTempChange = realTargetTemp - actualTempAtBoostStart;
 		Serial.print("BOOST_TEMP! expectedTempChange = ");
 		Serial.println(expectedTempChange);
-		HeatForDegrees(expectedTempChange);	
+		HeatForDegrees(expectedTempChange);
 		// change state
 		opState = BOOST_TEMP;
 		storedTargetTemp = targetTemp;
@@ -889,62 +927,62 @@ void HeatForDegrees(double degrees)
 {
 	if (degrees > 0)
 	{
-		
+
 		tBackToLow = 0;
 		tCheckStabilize = 0;
 		tStartBoostTemp = millis();
 		tBackToLow = millis() +  HeatingTimeNeeded(degrees);
-		tCheckStabilize = tBackToLow + tOperationalDelay;		
+		tCheckStabilize = tBackToLow + tOperationalDelay;
 
 		if ( (long) (millis() - tBackToLow) < 0)
-		{  
+		{
 		  turnOnRelay();
 		  Serial.print("HEAT ON ! tBackToLow = ");
 		  Serial.println(tBackToLow, DEC);
 		  Serial.print("tCheckStabilize = ");
 		  Serial.println(tCheckStabilize);
-		}  	
+		}
 	}
 }
 
 void PerformBoostTemp()
-{		
+{
    if ( (long) (millis() - tBackToLow) >= 0)
-   {  	    
+   {
 		//check if target temp changed and adapt timings
 		if (targetTemp > storedTargetTemp)
 		{
 			StartBoostToTarget();
 		}
-		 // wait for stabilization		 	 
-				 
+		 // wait for stabilization
+
 		// perform following checks every SAMPLE_DELAY when we reached tOperationalDelay since the temperature boost was started
 		if ( ((long) (millis() - tCheckStabilize) >= 0)  && isNewSample && isDerivativeReliable)
-		{ 	
-			// check if stabilizing 
+		{
+			// check if stabilizing
 			if  (IsStabilizingOrDropping())
-			{			
+			{
 				Serial.println("STabilized !");
 				FinishBoostTemp();
-			}   
-		}		 
-   } else {  
+			}
+		}
+   } else {
 		// switch ON heat and wait for tBackToLow
-		 if (digitalRead(RELAY_OUT_PIN) == LOW) {
+		 if (digitalRead(RELAY_OUT_PIN) == HIGH) {
 		   turnOnRelay();
-		 }	 		 
-		 
+		 }
+
 		//check if target temp changed and adapt timings
 		if (targetTemp != storedTargetTemp)
-		{		
+		{
 			double changeOffset =  targetTemp - storedTargetTemp;
 			double newExpectedTempChange = expectedTempChange + changeOffset;
-			
+
 			tBackToLow = tStartBoostTemp + HeatingTimeNeeded(newExpectedTempChange);
 			tCheckStabilize = tBackToLow + tOperationalDelay;
 			storedTargetTemp = targetTemp;
 			expectedTempChange = expectedTempChange + changeOffset;
-			
+
 			Serial.print("target temp changed, new tBackToLow = ");
 			Serial.println(tBackToLow);
 			Serial.print("target temp changed, new expectedTempChange = ");
@@ -955,11 +993,11 @@ void PerformBoostTemp()
 
 
 void FinishBoostTemp()
-{      
+{
 	AdaptGain(actualTemp);
-   
+
    Serial.println("FinishBoostTemp !");
-   
+
    // enter REGULATE state
    EnterRegulateStateOrWaitSmoothLowering();
 }
@@ -967,19 +1005,19 @@ void FinishBoostTemp()
 
 double predictTemp(unsigned long horizon)
 {
-	double horizonSeconds = horizon/1000;	
-		
-	// compute predicted value	
+	double horizonSeconds = horizon/1000;
+
+	// compute predicted value
 	return ((( tempPreviousArray[0] + tempPreviousArray[1] + tempPreviousArray[2] ) / 3 ) + (currentTempDerivative * horizonSeconds));
 }
 
 void AdaptGain(double resultingTemp)
 {
 	// only take account of ON_Durations > burnupTime and make sure we waited tOperationalDelay
-	unsigned long boostTempDuration = millis() - tStartBoostTemp;   
-	unsigned long boostOnTempDuration = tLastTurnOffRelay - tStartBoostTemp;   
+	unsigned long boostTempDuration = millis() - tStartBoostTemp;
+	unsigned long boostOnTempDuration = tLastTurnOffRelay - tStartBoostTemp;
     if ( boostTempDuration > tOperationalDelay && boostOnTempDuration > burnupTime )
-	{	
+	{
         double gain;
 		if (boostType == LOWBOOST)
 		{
@@ -989,46 +1027,46 @@ void AdaptGain(double resultingTemp)
 		{
 			gain = secondPerDegreeGainLarge;
 		}
-			
-			
+
+
 		double actualTempChange = resultingTemp - actualTempAtBoostStart;
-			
+
 		if (actualTempChange < (expectedTempChange / 5) )
 		{
 			gain = gain * 1.8;
-		} 
+		}
 		else
 		{
 		   if (actualTempChange < (expectedTempChange / 2) )
 		   {
 				gain = gain * 1.4;
-		   } 
+		   }
 		   else
 		   {
 			   if (expectedTempChange > 0.2 && actualTempChange > 0.1)
 			   {
 					// expectedTempChange > 0.2 serves to avoid big errors due to small changes
 					gain = gain * expectedTempChange / actualTempChange;
-			   } 		
+			   }
 		   }
 		}
-		
+
 		// Make sure adapted gain stays in acceptable boundaries  (from secondPerDegreeGainRef/3 to secondPerDegreeGainRef*3)
-			
+
 		if (gain > secondPerDegreeGainRef*3)
-			gain = secondPerDegreeGainRef*3;			
-			
+			gain = secondPerDegreeGainRef*3;
+
 		if (gain < secondPerDegreeGainRef/3)
 			gain = secondPerDegreeGainRef/3;
-					
+
 		switch (boostType)
 		{
-		case LOWBOOST:				
+		case LOWBOOST:
 			secondPerDegreeGainSmall = gain;
 			Serial.print("secondPerDegreeGainSmall =");
 			Serial.println(secondPerDegreeGainSmall);
 			break;
-		case HIGHBOOST:	
+		case HIGHBOOST:
 			secondPerDegreeGainLarge = gain;
 			Serial.print("secondPerDegreeGainLarge =");
 			Serial.println(secondPerDegreeGainLarge);
@@ -1056,7 +1094,7 @@ void setupCutOffTempForInitialRamping()
 	// calculate turn-off temperature
    firstRampCutOffTemp = initialTemp +  (targetTemp - initialTemp) * FIRST_RAMP_CUTOFF_RATIO;
    storedTargetTemp = targetTemp;
-   
+
    Serial.print("firstRampCutOffTemp = ");
    Serial.println(firstRampCutOffTemp, DEC);
 }
@@ -1068,34 +1106,34 @@ void PerformFirstRamp()
 		// target temp was changed ! Update firstRampCutOffTemp
 		setupCutOffTempForInitialRamping();
     }
-  
-    if (actualTemp > firstRampCutOffTemp) 
+
+    if (actualTemp > firstRampCutOffTemp)
     {
 		// switch off heat and wait for stabilization
-       if (digitalRead(RELAY_OUT_PIN) == HIGH) {
+       if (digitalRead(RELAY_OUT_PIN) == LOW) {
          Serial.print("STOP at actualTemp = ");
          Serial.println(actualTemp, DEC);
-         turnOffRelay();  
+         turnOffRelay();
          tFirstRampCutOff = millis();
        }
-       
+
        if ( isNewSample )
-       {            
+       {
           // check if stabilizing near setpoint
           if  ((abs(actualTemp - initialTemp) > abs(targetTemp - actualTemp)) && IsStabilizingOrDropping())
           {
             FinishInitialRamping();
-          }               
-       }        
+          }
+       }
     } else {
       // heat fullsteam ahead
-       if (digitalRead(RELAY_OUT_PIN) == LOW)     turnOnRelay();
-       
+       if (digitalRead(RELAY_OUT_PIN) == HIGH)     turnOnRelay();
+
        // try to find how much time is needed for system to react to heat
        if (((long) (millis() - tCheckTakeOff) >= 0) && (tOperationalDelay == 0))
-       {         
+       {
          tCheckTakeOff = millis() + SAMPLE_DELAY;
-         
+
          // try to find how much time is needed for system to react to heat
          if(tempPreviousArray[0] > tempPreviousArray[1] && tempPreviousArray[1] > tempPreviousArray[2] && tempPreviousArray[2] > tempPreviousArray[3] && tempPreviousArray[3] > tempPreviousArray[4])
          {
@@ -1103,7 +1141,7 @@ void PerformFirstRamp()
 		   burnupTime = tOperationalDelay / 20; // arbitrary... to be perfected
            Serial.print("tOperationalDelay = ");
            Serial.println(tOperationalDelay, DEC);
-         }          
+         }
        }
     }
 }
@@ -1113,7 +1151,7 @@ void FinishInitialRamping()
 {
   // Return to normal control after we detected stabilization
   tEndFirstRamp = millis();
-  
+
   // find top temperature before stabilization or drop
   double finalTemp = 0;
   for(int i=0;i<6;i++)
@@ -1123,9 +1161,9 @@ void FinishInitialRamping()
 		finalTemp = tempPreviousArray[i];
 	}
   }
-  
+
   secondPerDegreeGainRef = (tFirstRampCutOff - tStartFirstRamp) / (1000*(finalTemp - initialTemp));
-  secondPerDegreeGainLarge = secondPerDegreeGainRef;  
+  secondPerDegreeGainLarge = secondPerDegreeGainRef;
   secondPerDegreeGainSmall = secondPerDegreeGainLarge;
 
    Serial.print("FinishInitialRamping !   tEndFirstRamp = ");
@@ -1133,7 +1171,7 @@ void FinishInitialRamping()
    Serial.print("secondPerDegreeGainLarge = ");
    Serial.println(secondPerDegreeGainLarge);
 
-   
+
   // enter REGULATE state
    EnterRegulateStateOrWaitSmoothLowering();
 }
@@ -1142,40 +1180,40 @@ void FinishInitialRamping()
 void turnOnRelay()
 {
   	Serial.println("HEAT ON !");
-  digitalWrite(RELAY_OUT_PIN,HIGH);
+  digitalWrite(RELAY_OUT_PIN,LOW);
   tCheckNotHeatingWildly = millis() + ((unsigned long)60000 * MAX_HEATINGTIME_NO_TEMP_CHANGE_MINUTES);
   Serial.println("tCheckNotHeatingWildly =");
   Serial.println(tCheckNotHeatingWildly, DEC);
   tempBeforeHeating = actualTemp;
   isHeatOn = true;
 }
-    
+
 void turnOffRelay()
 {
-  digitalWrite(RELAY_OUT_PIN,LOW);
+  digitalWrite(RELAY_OUT_PIN,HIGH);
   tLastTurnOffRelay = millis();
   tCheckNotHeatingWildly = 0;
   isHeatOn = false;
-}    
-    
-// Security checks    
+}
+
+// Security checks
 void checkShutdownConditions(){
   boolean doShutdown = false;
-  
+
   // check for too long uptime
   if ( (long) (millis() - maxUptimeMillis) >= 0)
   {
     Serial.println(maxUptimeMillis);
     doShutdown = true;
   }
-  
+
   // check for too high temperature
   if (actualTemp > SHUTDOWN_TEMP)
   {
     Serial.println(actualTemp);
     doShutdown = true;
   }
-  
+
   // check for too long heating time with no temperature increase (temp probe can't be not trusted anymore so stop the device)
   if (tCheckNotHeatingWildly > 0 && isHeatOn && ( (long) (millis() - tCheckNotHeatingWildly) >= 0))
   {
@@ -1189,7 +1227,7 @@ void checkShutdownConditions(){
     tempBeforeHeating = actualTemp;
 	tCheckNotHeatingWildly = millis() + ((unsigned long)60000 * MAX_HEATINGTIME_NO_TEMP_CHANGE_MINUTES);
   }
-  
+
   if (doShutdown == true)
   {
     shutdownDevice();
@@ -1197,17 +1235,17 @@ void checkShutdownConditions(){
 }
 
 
-void shutdownDevice() 
+void shutdownDevice()
 {
     eraseDisplay();
 	displayActualTemp(0);
 	displayTargetTemp(0);
 
-    if (OUTPUT_TO_SERIAL) {      
+    if (OUTPUT_TO_SERIAL) {
         Serial.println("SHUTDOWN");
     }
     // turn off relay !
-    digitalWrite(RELAY_OUT_PIN,LOW);
+    digitalWrite(RELAY_OUT_PIN,HIGH);
 	isHeatOn = false;
     while(1)
     {
@@ -1216,18 +1254,18 @@ void shutdownDevice()
 }
 
 void readButtonInputs()
-{ 
+{
   // read buttons
   sw_tempMore = digitalRead(BT_TEMP_MORE_PIN);
   sw_tempLess = digitalRead(BT_TEMP_LESS_PIN);
 
-  
+
   // process inputs
-  if (sw_tempMore == LOW) { 
-    targetTemp= min(targetTemp + 0.5, MAX_TARGET_TEMP);    
+  if (sw_tempMore == LOW) {
+    targetTemp= min(targetTemp + 0.5, MAX_TARGET_TEMP);
     if (targetTemp > actualTemp)    isWaitingForTempAlert = true;
   }
-  if (sw_tempLess == LOW) targetTemp-=0.5; 
+  if (sw_tempLess == LOW) targetTemp-=0.5;
 }
 
 
@@ -1239,17 +1277,17 @@ void SetApproximatePulseDurationsForREgulation(double tempLost, unsigned long re
 }
 
 void SetPulseDurationsForREgulation(unsigned long neededUptimeForCompensate, unsigned long regDelay )
-{	
+{
 	Serial.print(" --- neededUptimeForCompensate = ");
 	Serial.println(neededUptimeForCompensate);
-	
-	// evenly distribute needed uptime						
-	if (neededUptimeForCompensate >= regDelay) 
+
+	// evenly distribute needed uptime
+	if (neededUptimeForCompensate >= regDelay)
 	{
 		// we would need full ontime! Call for a temp boost instead with slight overshoot
-		StartBoostToTarget(0.2);					
-	} 
-	else 
+		StartBoostToTarget(0.2);
+	}
+	else
 	{
 		// ensure pulses (ON and OFF periods) will not violate MIN_SWITCHING_TIME
 		while ( (regDelay / 2) < MIN_SWITCHING_TIME )
@@ -1267,30 +1305,30 @@ void SetPulseDurationsForREgulation(unsigned long neededUptimeForCompensate, uns
 			neededUptimeForCompensate = neededUptimeForCompensate * 2;
 			regDelay = regDelay *2 ;
 		}
-		
-		// 
+
+		//
 		int nbOnPulsePerRegPeriod = (int) neededUptimeForCompensate / MIN_SWITCHING_TIME;
 		int remainder = (int) neededUptimeForCompensate % MIN_SWITCHING_TIME;
 		durationOnPulse = MIN_SWITCHING_TIME + ((unsigned long)(remainder / nbOnPulsePerRegPeriod));
 		durationOffPulse = (regDelay - neededUptimeForCompensate) / nbOnPulsePerRegPeriod;
-		
+
 		// make sure OFF time is also greater than minimum switching time
 		while ( durationOffPulse < MIN_SWITCHING_TIME )
 		{
 			durationOffPulse = durationOffPulse * 2;
 			durationOnPulse = durationOnPulse *2 ;
 		}
-		
+
 		// store that we have good parameters for this temperature
 		parametersRegulationSetForTemp = targetTemp;
-		
+
 		Serial.print("durationOffPulse = ");
 		Serial.print(durationOffPulse);
 		Serial.print("   durationOnPulse = ");
-		Serial.println(durationOnPulse);	
+		Serial.println(durationOnPulse);
 	}
 }
-// 
+//
 
 /**************************************************************************************/
 /*                                                                                    */
@@ -1316,7 +1354,7 @@ void tempPreviousArrayPushValue(double val)
 bool IsStabilizingOrDropping()
 {
 	bool toReturn = false;
-	if (isDerivativeReliable && (tempPreviousArray[0] <= tempPreviousArray[1] && tempPreviousArray[1] <= tempPreviousArray[2] && tempPreviousArray[2] <= tempPreviousArray[3] && tempPreviousArray[3] <= tempPreviousArray[4]  && tempPreviousArray[4] <= tempPreviousArray[5])) toReturn = true;	
+	if (isDerivativeReliable && (tempPreviousArray[0] <= tempPreviousArray[1] && tempPreviousArray[1] <= tempPreviousArray[2] && tempPreviousArray[2] <= tempPreviousArray[3] && tempPreviousArray[3] <= tempPreviousArray[4]  && tempPreviousArray[4] <= tempPreviousArray[5])) toReturn = true;
 	//(currentTempDerivative < 0.001)
 	return toReturn;
 }
@@ -1365,28 +1403,28 @@ void printNumber(int wholePart, int decimalPart, boolean showDecimal, int displa
     int tens;
     int hundreds;
     int tenths;
-    int n = wholePart;  
+    int n = wholePart;
     // Erase and exit if wholePart does not fit
     if (wholePart > 999) {
         eraseDisplay(displayAddress, displaySide);
         return;
-    }  
-      
-    // Manage ShowDecimal Case 
+    }
+
+    // Manage ShowDecimal Case
     if (showDecimal && decimalPart < 10){
-      tenths = decimalPart;        
+      tenths = decimalPart;
     } else {
       showDecimal = false;
     }
-      
+
     // Compute individual digits
     ones= (int) (n%10);
     n=n/10;
     tens= (int) (n%10);
     n=n/10;
-    hundreds= (int) n;			
-    
-    
+    hundreds= (int) n;
+
+
     // Print the number digit by digit (do not print leading zeroes)
     if (showDecimal)
     {
@@ -1396,22 +1434,22 @@ void printNumber(int wholePart, int decimalPart, boolean showDecimal, int displa
       } else {
         eraseDigit(displayAddress,displaySide,3);
       }
-      if (wholePart > 9)      
-      { 
+      if (wholePart > 9)
+      {
         lc.setDigit(displayAddress,abs(REVERSE_DISPLAY-(displaySide+2)),(byte)tens,false);
       }else {
         eraseDigit(displayAddress,displaySide,2);
-      }      
+      }
       lc.setDigit(displayAddress,abs(REVERSE_DISPLAY-(displaySide+1)),(byte)ones,true);
       lc.setDigit(displayAddress,abs(REVERSE_DISPLAY-displaySide),(byte)tenths,forceLowerRight);
-    } 
+    }
     else
-    { 
+    {
       // ex :  946
       lc.setDigit(displayAddress,abs(REVERSE_DISPLAY-(displaySide+3)),' ',false);
       if (wholePart > 99)     {
         lc.setDigit(displayAddress,abs(REVERSE_DISPLAY-(displaySide+2)),(byte)hundreds,false);
-      } else {   
+      } else {
         eraseDigit(displayAddress,displaySide,2);
       }
       if (wholePart > 9)      {
@@ -1427,7 +1465,7 @@ void eraseDigit(int displayAddress, int displaySide, int digitIndex) {
     lc.setChar(displayAddress,abs(REVERSE_DISPLAY-(displaySide+digitIndex)),' ',false);
 }
 
-void eraseDisplay(int displayAddress, int displaySide) {       
+void eraseDisplay(int displayAddress, int displaySide) {
     // Erase the 4-digit
     eraseDigit(displayAddress,displaySide,0);
     eraseDigit(displayAddress,displaySide,1);
@@ -1435,13 +1473,13 @@ void eraseDisplay(int displayAddress, int displaySide) {
     eraseDigit(displayAddress,displaySide,3);
 }
 
-void eraseDisplay(int displayAddress) {       
+void eraseDisplay(int displayAddress) {
     // Erase the 2 sides of display
     eraseDisplay(displayAddress, DISPLAY_LEFT);
     eraseDisplay(displayAddress, DISPLAY_RIGHT);
 }
 
-void eraseDisplay() {       
+void eraseDisplay() {
     // Erase all displays
     for(int index=0;index<lc.getDeviceCount();index++) {
       eraseDisplay(index);
@@ -1449,16 +1487,16 @@ void eraseDisplay() {
 }
 
 void displayTemp(float temp, int side)
-{ 
+{
   boolean showDecimal = true;
-    
-  int decimalPart = (int) (((int)(temp * 100)) % 100); 
+
+  int decimalPart = (int) (((int)(temp * 100)) % 100);
   int tenths = decimalPart / 10;
-  
+
   int hundredths =  decimalPart % 10;
-  if (hundredths > 5) 
+  if (hundredths > 5)
   tenths = tenths + 1 ; // round to closest digit
-  
+
   printNumber((int) temp, tenths, showDecimal, TEMP_DISPLAY_DRIVER, side, false);
 }
 
@@ -1481,7 +1519,7 @@ void soundAlarm()
     tone(PIEZO_PIN, 650, 1000);
     //Serial.println("BIIP");
     delay(2000);
-  }  
+  }
 }
 
 void alertTemperatureNearlySet()
@@ -1490,7 +1528,7 @@ void alertTemperatureNearlySet()
   {
     soundAlarm();
     isWaitingForTempAlert = false;
-  }  
+  }
 }
 
 
@@ -1500,4 +1538,24 @@ float getTemperature()
   tGetTemperatureSample = millis() + SAMPLE_DELAY;
   sensors.requestTemperaturesByIndex(0); // Send the command to get temperatures
   return sensors.getTempC(tempProbeAddress);
+}
+
+int statusIndicator (int status) {
+	if (actualTemp == 0)
+	{
+		for (int n = 0; n < 10; n++) {
+	    digitalWrite(STATUS_INDICATOR_PIN, HIGH);   // turn the LED on (HIGH is the voltage level)
+	    delay(50);              // wait for a second
+	    digitalWrite(STATUS_INDICATOR_PIN, LOW);    // turn the LED off by making the voltage LOW
+	    delay(50);
+	  }
+		delay(2000);
+	}
+  for (int n = 0; n < status; n++) {
+    digitalWrite(STATUS_INDICATOR_PIN, HIGH);   // turn the LED on (HIGH is the voltage level)
+    delay(200);              // wait for a second
+    digitalWrite(STATUS_INDICATOR_PIN, LOW);    // turn the LED off by making the voltage LOW
+    delay(200);
+  }
+	delay(5000);
 }
